@@ -1,3 +1,5 @@
+import sqlite3
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -172,3 +174,141 @@ class Dataset300W(GenericDataset):
     def _get_data_item(self, item: int) -> Image.Image:
         data_path = self.data[item]
         return Image.open(data_path)
+
+
+class DatasetAFLW(GenericDataset):
+    """`DatasetAFLW <https://ieeexplore.ieee.org/abstract/document/6130513>`_ Dataset.
+
+    Args:
+        root (string): Root directory of dataset where directory
+            ``AFLW/flickr`` with ``0`` / ``2`` / ``3`` subdirectories exists.
+        split (str): split or splits to be returned. Can be a string or tuple of strings.
+            Default: ('train', 'valid', 'test').
+        transform (callable, optional): A function/transform that takes in an PIL image
+            and returns a transformed version. E.g, ``transforms.RandomCrop``
+        target_transform (callable, optional): A function/transform that takes in the
+            target and transforms it.
+        subset (str, optional): flickr.
+        download_url (str, optional): url to download zip file with Dataset.
+    """
+    base_folder = "AFLW"
+    sql_file_name = "aflw.sqlite"
+    empty_landmark_value = 0
+
+    def __init__(
+        self,
+        root: str,
+        split: Optional[str] = "train",
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        subset: Optional[str] = "flickr",
+        download_url: Optional[str] = "",
+    ) -> None:
+        # connect to SQL
+        sql_file = Path(root) / self.base_folder / self.sql_file_name
+        conn = sqlite3.connect(sql_file)
+        conn.row_factory = sqlite3.Row
+        self.sql_connection = conn.cursor()
+
+        super().__init__(
+            root=root,
+            split=split,
+            transform=transform,
+            target_transform=target_transform,
+            subset=subset,
+            download_url=download_url
+        )
+
+        faces_in_file = defaultdict(list)
+        for face in self.data:
+            faces_in_file[face["filepath"]].append(face["face_id"])
+        self.faces_in_file = faces_in_file
+
+    def _get_data(self) -> List[sqlite3.Row]:
+        """
+        Get Faces info from database.
+        """
+        faces_on_image_query = """
+        SELECT
+            faceimages.filepath,
+            faces.face_id,
+            facerect.x,
+            facerect.y, 
+            facerect.w, 
+            facerect.h
+        FROM
+            faces, facerect, faceimages
+        WHERE
+            faces.file_id = faceimages.file_id and
+            faces.face_id = facerect.face_id;
+        """
+        return self.sql_connection.execute(faces_on_image_query).fetchall()
+
+    def _get_target(self) -> Dict[str, Any]:
+        """
+        Facial Landmarks coordinates on image. Structured as Dict[`face_id`, List[int]].
+        """
+        face_details_query = """
+        SELECT
+            featurecoords.face_id,
+            featurecoords.feature_id,
+            featurecoords.x,
+            featurecoords.y
+        FROM
+            featurecoords;
+        """
+        feature_data = self.sql_connection.execute(face_details_query).fetchall()
+
+        # target_data dict of `face_id` with facial landmarks
+        target_data = defaultdict(
+            lambda: np.array([(self.empty_landmark_value, self.empty_landmark_value)] * 21)
+        )
+        for row in feature_data:
+            # feature_id starts from 1, let's start from 0 instead.
+            target_data[row["face_id"]][row["feature_id"] - 1] = (row["x"], row["y"])
+
+        return target_data
+
+    def _replace_not_positive_target(self, target: np.ndarray) -> np.ndarray:
+        """
+        Replace not positive coordinates with `self.empty_landmark_value`.
+        """
+        target[target <= 0] = self.empty_landmark_value
+        return target
+
+    def _get_target_item(self, item: int) -> np.ndarray:
+        data_item = self.data[item]
+        data_path = data_item["filepath"]
+        target = self.target[data_item["face_id"]]
+        if self._is_multiple_faces_on_image(data_path):
+            # correct coordinates for cropped image
+            face_x = data_item["x"]
+            face_y = data_item["y"]
+            target -= [face_x, face_y]
+        return self._replace_not_positive_target(target)
+
+    def _get_data_item(self, item: int) -> Image.Image:
+        data_item = self.data[item]
+        data_path = data_item["filepath"]
+        image = Image.open(self.files_path / data_path)
+        if self._is_multiple_faces_on_image(data_path):
+            # should crop an image
+            image_h, image_w = image.size
+
+            # Error correction
+            face_x = data_item["x"] if data_item["x"] >= 0 else 0
+            face_y = data_item["y"] if data_item["y"] >= 0 else 0
+            face_w = data_item["w"] if data_item["w"] <= image_w else image_w
+            face_h = data_item["h"] if data_item["h"] <= image_h else image_h
+
+            return image.crop((face_x, face_y, face_x + face_w, face_y + face_h))
+
+        return image
+
+    def _is_multiple_faces_on_image(self, data_path: str) -> bool:
+        """
+        Multiple Faces on one Image.
+
+        If True, image should be cropped and landmarks should be recalculated.
+        """
+        return len(self.faces_in_file.get(data_path)) > 1
