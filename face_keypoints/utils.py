@@ -1,43 +1,11 @@
 import os
-from typing import Dict
 
 import gdown
-import numpy as np
 from catalyst.contrib.datasets.misc import (
     _extract_archive,
     _check_integrity,
     _gen_bar_updater
 )
-
-
-def get_split(
-    length: int,
-    splits: Dict[str, float],
-    random: bool = False,
-    seed: int = 42,
-) -> Dict[str, list]:
-    """Creates named splits of indexes (0 to length) proportional to given fractions
-    in splits.values().
-
-    Args:
-        length: Length of indices to split
-        splits: Dictionary of split names and their ratios.
-        random: make random unordered splits, otherwise sequential split
-        seed: set a random seed
-
-    Returns:
-        Dictionary of named splits.
-    """
-    fracs = np.array(list(splits.values()))
-    fracs = fracs / fracs.sum()
-    sections = (fracs.cumsum() * length).astype(int)[:-1]
-    if random:
-        np.random.seed(seed)
-        inds = np.random.permutation(length)
-    else:
-        inds = np.arange(length)
-    parts = np.split(inds, sections)
-    return {name: data.tolist() for name, data in zip(splits, parts)}
 
 
 def download_url(url, root, filename=None, md5=None):
